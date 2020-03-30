@@ -11,7 +11,6 @@ typedef struct {
     size_t master_key_size;
 } private_keys;
 
-__declspec(noinline)
 extern
 void ssl_read_pk_data(struct ssl_st* ssl, private_keys* output) {
     if (ssl == NULL || output == NULL) {
@@ -27,9 +26,10 @@ void ssl_read_pk_data(struct ssl_st* ssl, private_keys* output) {
     output->master_key_size = session->master_key_length;
 }
 
-__declspec(noinline)
+typedef int (*ssl_connect_fn) (SSL *s);
+
 extern
-void* ssl_get_ssl_connect(struct ssl_st* ssl) {
+ssl_connect_fn ssl_get_ssl_connect(struct ssl_st* ssl) {
     if (ssl == NULL) {
         return 0;
     }

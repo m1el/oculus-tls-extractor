@@ -1,14 +1,13 @@
-#![allow(dead_code)]
-#![allow(non_snake_case)]
-
 use std::ffi::{c_void};
 use std::collections::{HashSet};
 use std::cell::RefCell;
-use std::fs::{OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{Write};
 use std::thread;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+#[allow(dead_code)]
+#[allow(non_snake_case)]
 mod winapi {
     use std::ffi::{c_void};
     pub type BOOL = i32;
@@ -104,83 +103,111 @@ mod winapi {
 use winapi::*;
 
 struct Patch {
-    location: isize,
+    name: &'static str,
+    call_addr: *mut c_void,
+    locations: &'static[isize],
     addr_offset: usize,
     expect: &'static[u8],
     replacement: &'static[u8],
 }
 
+#[derive(Debug)]
+enum PatchError {
+    NoLocationsSpecified,
+    OutOfRange,
+    CodeMismatch,
+    VirtualUnProtect,
+    VirtualReProtect,
+}
+
 impl Patch {
-    pub fn apply(&self, module_info: &MODULEINFO, call_addr: *mut c_void) {
-        unsafe {
+    pub fn apply(&self, module_info: &MODULEINFO) -> Result<isize, PatchError> {
+        let mut rv = Err(PatchError::NoLocationsSpecified);
+        for &location in self.locations {
             let maxlen = self.replacement.len().max(self.expect.len());
-            assert!(module_info.SizeOfImage as usize > self.location as usize + maxlen);
+            if (module_info.SizeOfImage as usize) < location as usize + maxlen {
+                rv = Err(PatchError::OutOfRange);
+                continue;
+            }
+
             let mut patch = self.replacement.to_vec();
             patch[self.addr_offset..self.addr_offset + std::mem::size_of::<usize>()]
-                .clone_from_slice(&(call_addr as usize).to_ne_bytes());
+                .clone_from_slice(&(self.call_addr as usize).to_ne_bytes());
 
-            let target_ptr = (module_info.lpBaseOfDll as *mut u8).offset(self.location);
-            let target_slice = std::slice::from_raw_parts_mut(target_ptr, maxlen);
-            assert_eq!(&target_slice[..self.expect.len()], self.expect);
+            unsafe {
+                let target_ptr = (module_info.lpBaseOfDll as *mut u8).offset(location);
+                let target_slice = std::slice::from_raw_parts_mut(target_ptr, maxlen);
+                if &target_slice[..self.expect.len()] != self.expect {
+                    rv = Err(PatchError::CodeMismatch);
+                    continue;
+                }
 
-            let mut before = 0;
-            let result = VirtualProtect(target_ptr as _, patch.len(), PAGE_READWRITE, &mut before as _);
-            assert!(result != 0);
-            target_slice[..patch.len()].clone_from_slice(&patch);
-            let result = VirtualProtect(target_ptr as _, patch.len(), PAGE_EXECUTE_READ, &mut before as _);
-            assert!(result != 0);
+                let mut before = 0;
+                let result = VirtualProtect(target_ptr as _, patch.len(), PAGE_READWRITE, &mut before as _);
+                if result == 0 {
+                    return Err(PatchError::VirtualUnProtect);
+                }
+                target_slice[..patch.len()].clone_from_slice(&patch);
+                let result = VirtualProtect(target_ptr as _, patch.len(), PAGE_EXECUTE_READ, &mut before as _);
+                if result == 0 {
+                    return Err(PatchError::VirtualReProtect);
+                }
+            }
+
+            return Ok(location);
         }
+        rv
     }
 }
 
-const INJECT1: Patch = Patch {
-    location: 0x7494ba,
-    addr_offset: 2,
-    // epxect to have: 5b 48 ff 60 28: POP EBP; JMP qword ptr [RAX + 0x28]
-    expect: &[0x48, 0x83, 0xc4, 0x20, 0x5b, 0x48, 0xff, 0x60, 0x28],
-    replacement: &[
-        0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // movabs rax, ptr
-        0xff, 0xd0,       // call   rax
-        0x48, 0x83, 0xc4, 0x20, // ADD RSP, 20
-        0x5b, // POP rbx
-        0xc3, // RET
-    ]
-};
+const PATCHES: &[Patch] = &[
+    Patch {
+        name: "SSL_connect",
+        call_addr: ssl_connect_and_peek as _,
+        locations: &[0x74322a, 0x7494ba], // newer first
+        addr_offset: 2,
+        // epxect to have: 5b 48 ff 60 28: POP RBX; REX.W JMP qword ptr [RAX + 0x28]
+        expect: &[0x48, 0x83, 0xc4, 0x20, 0x5b, 0x48, 0xff, 0x60, 0x28],
+        // mov  rax, 0x1337133713371337
+        // call rax
+        // add  rsp, 20
+        // pop  rbx
+        // ret
+        replacement: &[
+            0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // movabs rax, ptr
+            0xff, 0xd0,             // call   rax
+            0x48, 0x83, 0xc4, 0x20, // add rsp, 20
+            0x5b,                   // pop rbx
+            0xc3,                   // ret
+        ]
+    },
 
-const INJECT2: Patch = Patch {
-    location: 0x74a086,
-    addr_offset: 5,
-    // expect to have: 48 8b 5c 24 30: MOV RBX,qword ptr [RSP + 0x30]
-    expect: &[0x48, 0x8b, 0x5c, 0x24, 0x30],
-    // mov rcx, rbx
-    // mov rax, 0x1337133713371337
-    // call rax
-    // MOV        RBX,qword ptr [RSP + 0x30]
-    // ADD        RSP,0x20
-    // POP        RDI
-    // RET
-    //replacement: &[0x48, 0x8b, 0x5c, 0x24, 0x30],
-    replacement: &[
-        0x48, 0x89, 0xd9,             // mov    rcx,rbx
-        0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // movabs rax, ptr
-        0xff, 0xd0,                   // call   rax
-        0x48, 0x8b, 0x5c, 0x24, 0x30, // mov    rbx,QWORD PTR [rsp+0x30]
-        0x48, 0x83, 0xc4, 0x20,       // add    rsp,0x20
-        0x5f,                         // pop    rdi
-        0xc3,                         // ret
-    ]
-};
-
-struct SslStructReader {
-    s3: isize,
-    s3_random: isize,
-    s3_random_size: usize,
-    session: isize,
-    master_key: isize,
-    master_key_length: isize,
-    method: isize,
-    ssl_connect: isize,
-}
+    Patch {
+        name: "SSL_set_connect_state",
+        call_addr: peek_ssl_keys as _,
+        locations: &[0x743df6, 0x74a086], // newer first
+        addr_offset: 5,
+        // expect to have: 48 8b 5c 24 30: MOV RBX,qword ptr [RSP + 0x30]
+        expect: &[0x48, 0x8b, 0x5c, 0x24, 0x30],
+        // mov  rcx, rbx
+        // mov  rax, 0x1337133713371337
+        // call rax
+        // mov  rbx, qword ptr [rsp+0x30]
+        // add  rsp, 0x20
+        // pop  rdi
+        // ret
+        //replacement: &[0x48, 0x8b, 0x5c, 0x24, 0x30],
+        replacement: &[
+            0x48, 0x89, 0xd9,             // mov    rcx,rbx
+            0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // movabs rax, ptr
+            0xff, 0xd0,                   // call rax
+            0x48, 0x8b, 0x5c, 0x24, 0x30, // mov  rbx,qword ptr [rsp+0x30]
+            0x48, 0x83, 0xc4, 0x20,       // add  rsp,0x20
+            0x5f,                         // pop  rdi
+            0xc3,                         // ret
+        ]
+    },
+];
 
 #[repr(C)]
 struct PkData {
@@ -226,7 +253,7 @@ pub fn peek_ssl_keys(raw: *mut c_void) {
         if let Some(sender) = s.borrow_mut().as_ref() {
             let _ = sender.send(keys);
         } else {
-            // ?
+            // getting events before getting initialized?
         }
     });
 }
@@ -236,13 +263,7 @@ fn hex_char(byte: u8) -> u8 {
 }
 
 #[no_mangle]
-pub fn key_writer(receiver: Receiver<(Vec<u8>, Vec<u8>)>) {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("g:\\projects\\wrap\\keylog.txt")
-        .unwrap();
-
+pub fn key_writer(receiver: Receiver<(Vec<u8>, Vec<u8>)>, mut file: File) {
     let mut set = HashSet::new();
 
     while let Ok((client_random, master_key)) = receiver.recv() {
@@ -276,24 +297,37 @@ pub fn key_writer(receiver: Receiver<(Vec<u8>, Vec<u8>)>) {
 }
 
 #[no_mangle]
+#[allow(non_snake_case)]
 pub unsafe fn DllMain(
-    _hinstDLL: HINSTANCE,
-    fdwReason: DWORD,
-    _lpReserved: LPVOID
+    _hinst_dll: HINSTANCE,
+    fdw_reason: DWORD,
+    _lp_reserved: LPVOID
     ) -> BOOL
 {
-    if fdwReason == DLL_PROCESS_ATTACH {
+    if fdw_reason == DLL_PROCESS_ATTACH {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("g:\\projects\\wrap\\keylog.txt")
+            .unwrap();
+
         let (tx, rx) = channel();
         let proc = GetCurrentProcess();
         let handle = GetModuleHandleA(b"OculusAppFramework.dll\0".as_ptr() as _);
         let mut module_info: MODULEINFO = std::mem::zeroed();
         let result = K32GetModuleInformation(proc, handle, &mut module_info, std::mem::size_of::<MODULEINFO>() as DWORD);
         assert!(result != 0);
-        INJECT1.apply(&module_info, ssl_connect_and_peek as _);
-        INJECT2.apply(&module_info, peek_ssl_keys as _);
+
+        for patch in PATCHES {
+            match patch.apply(&module_info) {
+                Ok(addr) => write!(file, "patched: {} at 0x{:x}\n", patch.name, addr).unwrap(),
+                Err(ee) => write!(file, "cannot patch: {} {:?}\n", patch.name, ee).unwrap(),
+            }
+        }
+
         SENDER = Some(tx);
 
-        thread::spawn(move || key_writer(rx));
+        thread::spawn(move || key_writer(rx, file));
     }
     1
 }

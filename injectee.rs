@@ -313,6 +313,7 @@ pub unsafe fn DllMain(
                 temp.push("ssl_keylog.txt");
                 temp
             };
+        println!("SSL_KEYLOG_PATH={:?}", path);
 
         let mut file = OpenOptions::new()
             .create(true)

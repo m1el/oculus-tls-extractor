@@ -125,6 +125,10 @@ mod winapi {
 }
 use winapi::*;
 
+fn size_of_slice<T>(slice: &[T]) -> usize {
+    std::mem::size_of::<T>() * slice.len()
+}
+
 enum RunMode {
     Debug,
     Suspend,
@@ -189,18 +193,29 @@ fn main() {
             &mut proc_info as *mut PROCESS_INFORMATION);
 
         println!("CreateProcessW result = {}", result);
-        const LIB_PATH: &[u8] = b"g:\\projects\\wrap\\injectee.dll\0";
+
+        let mut library_path: Vec<u16>;
+        if let Ok(mut path) = env::current_exe() {
+            path.pop();
+            path.push("injectee.dll");
+            println!("library path: {:?}", path);
+            library_path = path.as_os_str().encode_wide().collect();
+            library_path.push(0);
+        } else {
+            println!("could not get current path!");
+            return;
+        }
 
         let kernel32_mod = GetModuleHandleA(b"Kernel32.dll\0".as_ptr() as _);
         println!("kernel32 module handle: {}", kernel32_mod as usize);
 
-        let load_library_ptr = GetProcAddress(kernel32_mod, b"LoadLibraryA\0".as_ptr() as _);
+        let load_library_ptr = GetProcAddress(kernel32_mod, b"LoadLibraryW\0".as_ptr() as _);
         println!("load_library_ptr: {}", load_library_ptr as usize);
 
-        let name_ptr = VirtualAllocEx(proc_info.hProcess, null_mut(), LIB_PATH.len(), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        let name_ptr = VirtualAllocEx(proc_info.hProcess, null_mut(), size_of_slice(&library_path) as _, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         println!("dll name ptr: {}", name_ptr as usize);
 
-        let result = WriteProcessMemory(proc_info.hProcess, name_ptr, LIB_PATH.as_ptr() as _, LIB_PATH.len() as _, null_mut());
+        let result = WriteProcessMemory(proc_info.hProcess, name_ptr, library_path.as_ptr() as _, size_of_slice(&library_path) as _, null_mut());
         println!("WriteProcessMemory result: {}", result);
 
         let mut threadid = 0;

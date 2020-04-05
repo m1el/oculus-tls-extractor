@@ -154,11 +154,16 @@ fn main() {
         println!("argv: {:?}", argv);
         println!("path: {:?}", argv[1]);
 
-        if env::var_os("SSL_KEYLOG_FILE").is_none() {
+        if let Some(path) = env::var_os("SSL_KEYLOG_FILE") {
+            println!("passing through SSL_KEYLOG_FILE={:?}", path);
+        } else {
             if let Ok(mut path) = env::current_exe() {
                 path.pop();
                 path.push("ssl_keylog.txt");
+                println!("putting keylog near currently running binary={:?}", path);
                 env::set_var("SSL_KEYLOG_FILE", path);
+            } else {
+                println!("could not get SSL_KEYLOG_FILE and current program path?..");
             }
         }
 

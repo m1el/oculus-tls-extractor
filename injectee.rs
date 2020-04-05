@@ -121,7 +121,7 @@ enum PatchError {
 }
 
 impl Patch {
-    pub fn apply(&self, module_info: &MODULEINFO) -> Result<isize, PatchError> {
+    pub unsafe fn apply(&self, module_info: &MODULEINFO) -> Result<isize, PatchError> {
         let mut rv = Err(PatchError::NoLocationsSpecified);
         for &location in self.locations {
             let maxlen = self.replacement.len().max(self.expect.len());
@@ -134,24 +134,22 @@ impl Patch {
             patch[self.addr_offset..self.addr_offset + std::mem::size_of::<usize>()]
                 .clone_from_slice(&(self.call_addr as usize).to_ne_bytes());
 
-            unsafe {
-                let target_ptr = (module_info.lpBaseOfDll as *mut u8).offset(location);
-                let target_slice = std::slice::from_raw_parts_mut(target_ptr, maxlen);
-                if &target_slice[..self.expect.len()] != self.expect {
-                    rv = Err(PatchError::CodeMismatch);
-                    continue;
-                }
+            let target_ptr = (module_info.lpBaseOfDll as *mut u8).offset(location);
+            let target_slice = std::slice::from_raw_parts_mut(target_ptr, maxlen);
+            if &target_slice[..self.expect.len()] != self.expect {
+                rv = Err(PatchError::CodeMismatch);
+                continue;
+            }
 
-                let mut before = 0;
-                let result = VirtualProtect(target_ptr as _, patch.len(), PAGE_READWRITE, &mut before as _);
-                if result == 0 {
-                    return Err(PatchError::VirtualUnProtect);
-                }
-                target_slice[..patch.len()].clone_from_slice(&patch);
-                let result = VirtualProtect(target_ptr as _, patch.len(), PAGE_EXECUTE_READ, &mut before as _);
-                if result == 0 {
-                    return Err(PatchError::VirtualReProtect);
-                }
+            let mut before = 0;
+            let result = VirtualProtect(target_ptr as _, patch.len(), PAGE_READWRITE, &mut before as _);
+            if result == 0 {
+                return Err(PatchError::VirtualUnProtect);
+            }
+            target_slice[..patch.len()].clone_from_slice(&patch);
+            let result = VirtualProtect(target_ptr as _, patch.len(), PAGE_EXECUTE_READ, &mut before as _);
+            if result == 0 {
+                return Err(PatchError::VirtualReProtect);
             }
 
             return Ok(location);

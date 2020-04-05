@@ -1,10 +1,12 @@
-use std::ffi::{c_void};
-use std::collections::{HashSet};
 use std::cell::RefCell;
+use std::collections::{HashSet};
+use std::env;
+use std::ffi::{c_void};
 use std::fs::{File, OpenOptions};
 use std::io::{Write};
-use std::thread;
+use std::path::{PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread;
 
 #[allow(dead_code)]
 #[allow(non_snake_case)]
@@ -303,11 +305,20 @@ pub unsafe fn DllMain(
     ) -> BOOL
 {
     if fdw_reason == DLL_PROCESS_ATTACH {
+        let path =
+            if let Some(ssl_keylog) = env::var_os("SSL_KEYLOG_FILE") {
+                PathBuf::from(ssl_keylog)
+            } else {
+                let mut temp = env::temp_dir();
+                temp.push("ssl_keylog.txt");
+                temp
+            };
+
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open("g:\\projects\\wrap\\keylog.txt")
-            .unwrap();
+            .open(path)
+            .expect("could not open ssllog");
 
         let (tx, rx) = channel();
         let proc = GetCurrentProcess();

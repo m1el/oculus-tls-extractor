@@ -1,7 +1,7 @@
-use std::ptr::null_mut;
-use std::env::args_os;
+use std::env::{self, args_os};
 use std::ffi::{OsString};
 use std::os::windows::ffi::{OsStrExt};
+use std::ptr::null_mut;
 
 #[allow(dead_code)]
 #[allow(non_snake_case)]
@@ -153,6 +153,14 @@ fn main() {
         args.push(0);
         println!("argv: {:?}", argv);
         println!("path: {:?}", argv[1]);
+
+        if env::var_os("SSL_KEYLOG_FILE").is_none() {
+            if let Ok(mut path) = env::current_exe() {
+                path.pop();
+                path.push("ssl_keylog.txt");
+                env::set_var("SSL_KEYLOG_FILE", path);
+            }
+        }
 
         let mut proc_info: PROCESS_INFORMATION = std::mem::zeroed();
         let mut startup_info: STARTUPINFOW = std::mem::zeroed();

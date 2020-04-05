@@ -166,7 +166,7 @@ const PATCHES: &[Patch] = &[
         call_addr: ssl_connect_and_peek as _,
         locations: &[0x74322a, 0x7494ba], // newer first
         addr_offset: 2,
-        // epxect to have: 5b 48 ff 60 28: POP RBX; REX.W JMP qword ptr [RAX + 0x28]
+        // expect to have: 5b 48 ff 60 28: POP RBX; REX.W JMP qword ptr [RAX + 0x28]
         expect: &[0x48, 0x83, 0xc4, 0x20, 0x5b, 0x48, 0xff, 0x60, 0x28],
         // mov  rax, 0x1337133713371337
         // call rax
@@ -196,7 +196,6 @@ const PATCHES: &[Patch] = &[
         // add  rsp, 0x20
         // pop  rdi
         // ret
-        //replacement: &[0x48, 0x8b, 0x5c, 0x24, 0x30],
         replacement: &[
             0x48, 0x89, 0xd9,             // mov    rcx,rbx
             0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // movabs rax, ptr
@@ -225,9 +224,6 @@ extern "C" {
 }
 
 static mut SENDER: Option<Sender<(Vec<u8>, Vec<u8>)>> = None;
-thread_local! {
-    static LOCAL_SENDER: RefCell<Option<Sender<(Vec<u8>, Vec<u8>)>>> = RefCell::new(unsafe { SENDER.clone() });
-}
 
 #[no_mangle]
 pub unsafe fn ssl_connect_and_peek(raw: *mut c_void) -> i32 {
@@ -248,6 +244,10 @@ pub fn peek_ssl_keys(raw: *mut c_void) {
             master_key.to_vec()
         )
     };
+
+    thread_local! {
+        static LOCAL_SENDER: RefCell<Option<Sender<(Vec<u8>, Vec<u8>)>>> = RefCell::new(unsafe { SENDER.clone() });
+    }
 
     LOCAL_SENDER.with(|s| {
         if let Some(sender) = s.borrow_mut().as_ref() {

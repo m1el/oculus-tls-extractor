@@ -1,0 +1,15 @@
+diff --git a/util/mk1mf.pl b/util/mk1mf.pl
+index ee14dafea6..bd023c61d8 100755
+--- a/util/mk1mf.pl
++++ b/util/mk1mf.pl
+@@ -627,6 +627,10 @@ reallyclean:
+ 	\$(RM) -rf \$(LIB_D)
+ 	\$(RM) -rf \$(INC_D)
+ 
++ssl_inspector: ..\\ssl_inspector.c
++	\$(CC) /DEBUG /Fo:ssl_inspector.obj /c \$(LIB_CFLAGS) ..\\ssl_inspector.c /Fd:..\\ssl_inspector.pdb
++	\$(MKLIB) /OUT:..\\ssl_inspector.lib ssl_inspector.obj
++
+ EOF
+ 
+ if ($orig_platform ne 'copy')

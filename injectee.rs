@@ -1,3 +1,6 @@
+/// injectee -- this DLL will be injected into OVRServer_x64 process
+///
+/// It will patch SSL functions in order to extract private keys
 use std::cell::RefCell;
 use std::collections::{HashSet};
 use std::env;
@@ -8,6 +11,7 @@ use std::path::{PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
+/// winapi module -- describing enough win32api surface to work with
 #[allow(dead_code)]
 #[allow(non_snake_case)]
 mod winapi {
@@ -104,27 +108,49 @@ mod winapi {
 
 use winapi::*;
 
+/// Patch -- patch for program code
+///
+/// This allows us to overwrite in-memory code of the running process
+/// to insert ourselves so we can snoop on the data.
 struct Patch {
+    /// Human-readable name of the patch.
+    /// Currently maps to SSL function we patch.
     name: &'static str,
+    /// What address we should call with ssl_state pointer
     call_addr: *mut c_void,
-    locations: &'static[isize],
+    /// Location of call address in the "replacement" code
     addr_offset: usize,
+    /// List of patch target locations.
+    /// This allows us to support multiple versions of the binary
+    locations: &'static[isize],
+    /// What code is expected at the specified location.
+    /// This allows us to check if the binary has changed
+    /// We don't want to overwrite random code.
     expect: &'static[u8],
+    /// What code we should write in.
     replacement: &'static[u8],
 }
 
+/// Describes possible failures we could encounter when patching
 #[derive(Debug)]
 enum PatchError {
+    /// Locations slice is empty
     NoLocationsSpecified,
+    /// Patch location is out of range of the DLL address space
     OutOfRange,
+    /// Code at the specified location did not match expectation.
+    /// Probably means an unsupported version of the DLL
     CodeMismatch,
+    /// Could not set memory protection to Read+Write
     VirtualUnProtect,
+    /// Could not set memory protection to Read+Execute
     VirtualReProtect,
 }
 
 impl Patch {
     pub unsafe fn apply(&self, module_info: &MODULEINFO) -> Result<isize, PatchError> {
         let mut rv = Err(PatchError::NoLocationsSpecified);
+
         for &location in self.locations {
             let maxlen = self.replacement.len().max(self.expect.len());
             if (module_info.SizeOfImage as usize) < location as usize + maxlen {
@@ -132,6 +158,7 @@ impl Patch {
                 continue;
             }
 
+            // write in call address at addr_offset in the patch
             let mut patch = self.replacement.to_vec();
             patch[self.addr_offset..self.addr_offset + std::mem::size_of::<usize>()]
                 .clone_from_slice(&(self.call_addr as usize).to_ne_bytes());
@@ -143,12 +170,16 @@ impl Patch {
                 continue;
             }
 
+            // VirtualProtect requires us to pass a pointer to flOldProtect
             let mut before = 0;
+            // Set memory protection to Read+Write
             let result = VirtualProtect(target_ptr as _, patch.len(), PAGE_READWRITE, &mut before as _);
             if result == 0 {
                 return Err(PatchError::VirtualUnProtect);
             }
+            // Actually apply the patch
             target_slice[..patch.len()].clone_from_slice(&patch);
+            // Set memory protection to Read+Execute
             let result = VirtualProtect(target_ptr as _, patch.len(), PAGE_EXECUTE_READ, &mut before as _);
             if result == 0 {
                 return Err(PatchError::VirtualReProtect);
@@ -164,8 +195,8 @@ const PATCHES: &[Patch] = &[
     Patch {
         name: "SSL_connect",
         call_addr: ssl_connect_and_peek as _,
-        locations: &[0x74322a, 0x7494ba], // newer first
         addr_offset: 2,
+        locations: &[0x74322a, 0x7494ba], // newer first
         // expect to have: 5b 48 ff 60 28: POP RBX; REX.W JMP qword ptr [RAX + 0x28]
         expect: &[0x48, 0x83, 0xc4, 0x20, 0x5b, 0x48, 0xff, 0x60, 0x28],
         // mov  rax, 0x1337133713371337
@@ -185,8 +216,8 @@ const PATCHES: &[Patch] = &[
     Patch {
         name: "SSL_set_connect_state",
         call_addr: peek_ssl_keys as _,
-        locations: &[0x743df6, 0x74a086], // newer first
         addr_offset: 5,
+        locations: &[0x743df6, 0x74a086], // newer first
         // expect to have: 48 8b 5c 24 30: MOV RBX,qword ptr [RSP + 0x30]
         expect: &[0x48, 0x8b, 0x5c, 0x24, 0x30],
         // mov  rcx, rbx
@@ -208,6 +239,19 @@ const PATCHES: &[Patch] = &[
     },
 ];
 
+// This sender will be used by all threads to clone their own senders from.
+// We don't control when threads start or what they're data is going to be.
+static mut SENDER: Option<Sender<(Vec<u8>, Vec<u8>)>> = None;
+
+thread_local! {
+    // ... each thread is going to store its own sender in ThreadLocalStorage
+    // cloned from the global SENDER
+    static LOCAL_SENDER: RefCell<Option<Sender<(Vec<u8>, Vec<u8>)>>> =
+        RefCell::new(unsafe { SENDER.clone() });
+}
+
+/// PkData -- struct used to pass private key data from `ssl_inspector`
+/// The matching struct in `ssl_inspector` is `private_keys`.
 #[repr(C)]
 struct PkData {
     client_random: *mut u8,
@@ -223,8 +267,8 @@ extern "C" {
     fn ssl_get_ssl_connect(raw: *mut c_void) -> SslConnectFn;
 }
 
-static mut SENDER: Option<Sender<(Vec<u8>, Vec<u8>)>> = None;
-
+// There is too little space after SSL_connect function.
+// One solution is to move part of that function here.
 #[no_mangle]
 pub unsafe fn ssl_connect_and_peek(raw: *mut c_void) -> i32 {
     let rv = ssl_get_ssl_connect(raw)(raw);
@@ -232,63 +276,70 @@ pub unsafe fn ssl_connect_and_peek(raw: *mut c_void) -> i32 {
     rv
 }
 
+// Extract private keys using pointer to ssl_state struct and
+// send them to the writer thread.
 #[no_mangle]
-pub fn peek_ssl_keys(raw: *mut c_void) {
-    let keys = unsafe {
+pub unsafe fn peek_ssl_keys(raw: *mut c_void) {
+    let keys = {
         let mut pk_data = std::mem::zeroed();
         ssl_read_pk_data(raw, &mut pk_data);
-        let client_random = std::slice::from_raw_parts(pk_data.client_random, pk_data.client_random_size);
-        let master_key = std::slice::from_raw_parts(pk_data.master_key, pk_data.master_key_size);
+        let client_random = std::slice::from_raw_parts(
+            pk_data.client_random, pk_data.client_random_size);
+        let master_key = std::slice::from_raw_parts(
+            pk_data.master_key, pk_data.master_key_size);
+
         (
             client_random.to_vec(),
             master_key.to_vec()
         )
     };
 
-    thread_local! {
-        static LOCAL_SENDER: RefCell<Option<Sender<(Vec<u8>, Vec<u8>)>>> = RefCell::new(unsafe { SENDER.clone() });
-    }
-
     LOCAL_SENDER.with(|s| {
         if let Some(sender) = s.borrow_mut().as_ref() {
             let _ = sender.send(keys);
         } else {
-            // getting events before getting initialized?
+            // This shouldn't happen and we don't really want to panic
+            println!("Snaaaaake!");
         }
     });
 }
 
-fn hex_char(byte: u8) -> u8 {
-    b"0123456789abcdef"[(byte & 0xf) as usize]
+/// Write hex dump of source bytes to target Vec
+fn dump_hex(source: &[u8], target: &mut Vec<u8>) {
+    const HEX: &[u8] = b"0123456789abcdef";
+    for &chr in source {
+        target.push(HEX[(chr >> 4) as usize]);
+        target.push(HEX[(chr & 0xf) as usize]);
+    }
 }
 
-#[no_mangle]
-pub fn key_writer(receiver: Receiver<(Vec<u8>, Vec<u8>)>, mut file: File) {
+/// key writing thread
+/// This will recive messages from multiple threads over rx channel.
+/// And write them to the log file.
+fn key_writer(receiver: Receiver<(Vec<u8>, Vec<u8>)>, mut file: File) {
     let mut set = HashSet::new();
 
     while let Ok((client_random, master_key)) = receiver.recv() {
+        // zero client_random means it was not initialized yet
         if client_random.iter().all(|&c| c == 0) {
             file.write_all(b"ZERO_CLIENT_RANDOM\n").unwrap();
             continue;
         }
+        // similar situation with master key
         if master_key.is_empty() {
             file.write_all(b"EMPTY_MASTER_KEY\n").unwrap();
             continue;
         }
 
         let mut line = b"CLIENT_RANDOM ".to_vec();
-        for byte in client_random {
-            line.push(hex_char(byte >> 4));
-            line.push(hex_char(byte >> 0));
-        }
-        line.push(b' ');
 
-        for byte in master_key {
-            line.push(hex_char(byte >> 4));
-            line.push(hex_char(byte >> 0));
-        }
+        line.reserve(client_random.len() + master_key.len() + 2);
+        dump_hex(&client_random, &mut line);
+        line.push(b' ');
+        dump_hex(&master_key, &mut line);
         line.push(b'\n');
 
+        // let's not print duplicates
         if !set.contains(&line) {
             file.write_all(&line).unwrap();
             set.insert(line);
@@ -296,6 +347,51 @@ pub fn key_writer(receiver: Receiver<(Vec<u8>, Vec<u8>)>, mut file: File) {
     }
 }
 
+/// initialize will open ssl keylog file, apply patches,
+/// create global SENDER and start the key writer thread.
+unsafe fn initialize() {
+    // decide keylog path depending on env
+    let path =
+        if let Some(ssl_keylog) = env::var_os("SSL_KEYLOG_FILE") {
+            PathBuf::from(ssl_keylog)
+        } else {
+            // ... or use temp dir
+            let mut temp = env::temp_dir();
+            temp.push("ssl_keylog.txt");
+            temp
+        };
+    println!("SSL_KEYLOG_PATH={:?}", path);
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("could not open ssllog");
+
+    let (tx, rx) = channel();
+    SENDER = Some(tx);
+
+    let proc = GetCurrentProcess();
+    let handle = GetModuleHandleA(b"OculusAppFramework.dll\0".as_ptr() as _);
+    let mut module_info: MODULEINFO = std::mem::zeroed();
+    let result = K32GetModuleInformation(
+        proc, handle, &mut module_info,
+        std::mem::size_of::<MODULEINFO>() as DWORD);
+    assert!(result != 0);
+
+    for patch in PATCHES {
+        match patch.apply(&module_info) {
+            Ok(addr) => write!(file, "patched: {} at 0x{:x}\n",
+                               patch.name, addr).unwrap(),
+            Err(ee) => write!(file, "cannot patch: {} {:?}\n",
+                              patch.name, ee).unwrap(),
+        }
+    }
+
+    thread::spawn(move || key_writer(rx, file));
+}
+
+/// Entry point for the DLL
 #[no_mangle]
 #[allow(non_snake_case)]
 pub unsafe fn DllMain(
@@ -304,40 +400,10 @@ pub unsafe fn DllMain(
     _lp_reserved: LPVOID
     ) -> BOOL
 {
+    // This function can be called on many occasions.
+    // We only want to do initialization on DLL load.
     if fdw_reason == DLL_PROCESS_ATTACH {
-        let path =
-            if let Some(ssl_keylog) = env::var_os("SSL_KEYLOG_FILE") {
-                PathBuf::from(ssl_keylog)
-            } else {
-                let mut temp = env::temp_dir();
-                temp.push("ssl_keylog.txt");
-                temp
-            };
-        println!("SSL_KEYLOG_PATH={:?}", path);
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .expect("could not open ssllog");
-
-        let (tx, rx) = channel();
-        let proc = GetCurrentProcess();
-        let handle = GetModuleHandleA(b"OculusAppFramework.dll\0".as_ptr() as _);
-        let mut module_info: MODULEINFO = std::mem::zeroed();
-        let result = K32GetModuleInformation(proc, handle, &mut module_info, std::mem::size_of::<MODULEINFO>() as DWORD);
-        assert!(result != 0);
-
-        for patch in PATCHES {
-            match patch.apply(&module_info) {
-                Ok(addr) => write!(file, "patched: {} at 0x{:x}\n", patch.name, addr).unwrap(),
-                Err(ee) => write!(file, "cannot patch: {} {:?}\n", patch.name, ee).unwrap(),
-            }
-        }
-
-        SENDER = Some(tx);
-
-        thread::spawn(move || key_writer(rx, file));
+        initialize();
     }
     1
 }

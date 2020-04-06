@@ -238,7 +238,7 @@ fn main() {
         let kernel32_mod = GetModuleHandleA(b"Kernel32.dll\0".as_ptr() as _);
         println!("kernel32 module handle: {}", kernel32_mod as usize);
 
-        // 1) kernel32.dll has the same location in all running processes
+        // 1) kernel32.dll has the same address space in all running processes
         let load_library_ptr = GetProcAddress(
             kernel32_mod, b"LoadLibraryW\0".as_ptr() as _);
         println!("load_library_ptr: {}", load_library_ptr as usize);

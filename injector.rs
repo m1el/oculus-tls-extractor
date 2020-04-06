@@ -1,8 +1,22 @@
+/// injector -- an executable responsible for running OVRServer_x64.exe
+/// in debug mode and injecting injectee.dll
+///
+/// Usage:
+///
+/// One way to use this is to use global flags (see: gflags).
+///
+/// Create registry key
+/// `HKEY_LOCAL_MACHINE/SOFTWARE/Microsoft/Windows NT/CurrentVersion/Image File Execution Options/OVRServer_x64.exe`
+/// and a `Debugger` string value =
+/// `"path_to\injector.exe" "path_to\OVRServer_x64.exe"`.
+/// This will run `injector.exe` as a debugger for `OVRServer_x64`,
+/// which allows us to completely control it.
 use std::env::{self, args_os};
 use std::ffi::{OsString};
 use std::os::windows::ffi::{OsStrExt};
 use std::ptr::null_mut;
 
+/// winapi module -- describing enough win32api surface to work with
 #[allow(dead_code)]
 #[allow(non_snake_case)]
 #[allow(non_camel_case_types)]
@@ -125,12 +139,17 @@ mod winapi {
 }
 use winapi::*;
 
+/// Return size of slice in bytes
 fn size_of_slice<T>(slice: &[T]) -> usize {
     std::mem::size_of::<T>() * slice.len()
 }
 
+/// enum that defines how we should start the process.
+/// This influences dwCreationFlags in CreateProcessW.
 enum RunMode {
+    /// Start process with debug flag
     Debug,
+    /// Start a suspended process
     Suspend,
 }
 
@@ -146,6 +165,9 @@ fn main() {
 
         let mut path: Vec<u16> = argv[1].encode_wide().collect();
         path.push(0);
+
+        // Concatenate arguments to create command line
+        // TODO: this does not handle quotes, that doesn't seem to be necessary
         let mut args = Vec::<u16>::new();
         for arg in &argv[1..] {
             if !args.is_empty() {
@@ -158,9 +180,12 @@ fn main() {
         println!("argv: {:?}", argv);
         println!("path: {:?}", argv[1]);
 
+        // Try SSL_KEYLOG_FILE env var, like a feature we're trying to mimick
+        // The injectee DLL will read this env var
         if let Some(path) = env::var_os("SSL_KEYLOG_FILE") {
             println!("passing through SSL_KEYLOG_FILE={:?}", path);
         } else {
+            // That was not provided, use the directory of the executable
             if let Ok(mut path) = env::current_exe() {
                 path.pop();
                 path.push("ssl_keylog.txt");
@@ -180,6 +205,7 @@ fn main() {
             RunMode::Suspend => CREATE_SUSPENDED,
         };
 
+        // Create a suspended or debugged process
         let result = CreateProcessW(
             path.as_mut_ptr(),
             args.as_mut_ptr(),
@@ -195,6 +221,8 @@ fn main() {
         println!("CreateProcessW result = {}", result);
 
         let mut library_path: Vec<u16>;
+
+        // assume injectee.dll is near currently running executable
         if let Ok(mut path) = env::current_exe() {
             path.pop();
             path.push("injectee.dll");
@@ -206,25 +234,45 @@ fn main() {
             return;
         }
 
+        // DLL injection
         let kernel32_mod = GetModuleHandleA(b"Kernel32.dll\0".as_ptr() as _);
         println!("kernel32 module handle: {}", kernel32_mod as usize);
 
-        let load_library_ptr = GetProcAddress(kernel32_mod, b"LoadLibraryW\0".as_ptr() as _);
+        // 1) kernel32.dll has the same location in all running processes
+        let load_library_ptr = GetProcAddress(
+            kernel32_mod, b"LoadLibraryW\0".as_ptr() as _);
         println!("load_library_ptr: {}", load_library_ptr as usize);
 
-        let name_ptr = VirtualAllocEx(proc_info.hProcess, null_mut(), size_of_slice(&library_path) as _, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        println!("dll name ptr: {}", name_ptr as usize);
+        // All following operations require us to have certain access
+        // to the process, but since we started it in debug mode,
+        // we probably have that access.
+        //
+        // 2) Allocate memory for DLL path in the target process
+        let name_ptr = VirtualAllocEx(
+            proc_info.hProcess, null_mut(), size_of_slice(&library_path) as _,
+            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        println!("DLL name ptr: {}", name_ptr as usize);
 
-        let result = WriteProcessMemory(proc_info.hProcess, name_ptr, library_path.as_ptr() as _, size_of_slice(&library_path) as _, null_mut());
+        // 3) Write library path to the recently allocated memory
+        let result = WriteProcessMemory(
+            proc_info.hProcess, name_ptr, library_path.as_ptr() as _,
+            size_of_slice(&library_path) as _, null_mut());
         println!("WriteProcessMemory result: {}", result);
 
+        // 4) CreateRemoteThread with kernel32.LoadLibraryW as a starting point
+        //    and injectee DLL path as its only argument.
         let mut threadid = 0;
-        let thread_handle = CreateRemoteThread(proc_info.hProcess, null_mut(), 0, load_library_ptr as _, name_ptr, 0, &mut threadid as _);
+        let thread_handle = CreateRemoteThread(
+                proc_info.hProcess, null_mut(), 0,
+                load_library_ptr as _, name_ptr, 0, &mut threadid as _);
         println!("CreateRemoteThread result: {}", thread_handle as usize);
 
+        // If we started the process in debug mode, the recently
+        // created thread won't run, so ignore this code for now
         // let result = WaitForSingleObject(thread_handle, INFINITE);
         // println!("WaitForSingleObject result = {}", result);
 
+        // Finally, resume the process, depending on how we started it
         match RUN_MODE {
             RunMode::Debug => {
                 let result = DebugActiveProcessStop(proc_info.dwProcessId);
@@ -236,6 +284,8 @@ fn main() {
             }
         }
 
+        // After everything is done, wait for the project to die.
+        // TODO: pass events so that the service can be stopped normally.
         let result = WaitForSingleObject(proc_info.hProcess, INFINITE);
         println!("WaitForSingleObject result = {}", result);
     }

@@ -108,7 +108,7 @@ mod winapi {
 
 use winapi::*;
 
-/// Patch -- patch for program code
+/// Patch -- describes a change made to in-memory program code
 ///
 /// This allows us to overwrite in-memory code of the running process
 /// to insert ourselves so we can snoop on the data.
@@ -124,8 +124,8 @@ struct Patch {
     /// This allows us to support multiple versions of the binary
     locations: &'static[isize],
     /// What code is expected at the specified location.
-    /// This allows us to check if the binary has changed
-    /// We don't want to overwrite random code.
+    /// This allows us to check if the binary has been updated.
+    /// We don't want to blindly overwrite random code.
     expect: &'static[u8],
     /// What code we should write in.
     replacement: &'static[u8],
@@ -148,6 +148,11 @@ enum PatchError {
 }
 
 impl Patch {
+    /// Apply a patch to a module described by `module_info`.
+    ///
+    /// Returns either location of change or error occured during patch.
+    /// This function will try to apply patch on multiple location
+    /// and return first success or last error.
     pub unsafe fn apply(&self, module_info: &MODULEINFO) -> Result<isize, PatchError> {
         let mut rv = Err(PatchError::NoLocationsSpecified);
 
@@ -260,6 +265,7 @@ struct PkData {
     master_key_size: usize,
 }
 
+/// Pointer to ssl->method->ssl_connect
 type SslConnectFn = extern "C" fn(*mut c_void) -> i32;
 
 extern "C" {
@@ -267,8 +273,9 @@ extern "C" {
     fn ssl_get_ssl_connect(raw: *mut c_void) -> SslConnectFn;
 }
 
-// There is too little space after SSL_connect function.
-// One solution is to move part of that function here.
+/// There is too little space after SSL_connect function.
+/// One solution is to move part of that function here.
+/// We patch out ssl->method->ssl_connect() and do it here
 #[no_mangle]
 pub unsafe fn ssl_connect_and_peek(raw: *mut c_void) -> i32 {
     let rv = ssl_get_ssl_connect(raw)(raw);
@@ -276,8 +283,8 @@ pub unsafe fn ssl_connect_and_peek(raw: *mut c_void) -> i32 {
     rv
 }
 
-// Extract private keys using pointer to ssl_state struct and
-// send them to the writer thread.
+/// Extract private keys using pointer to ssl_state struct and
+/// send them to the writer thread.
 #[no_mangle]
 pub unsafe fn peek_ssl_keys(raw: *mut c_void) {
     let keys = {

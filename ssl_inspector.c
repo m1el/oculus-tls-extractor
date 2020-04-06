@@ -2,7 +2,7 @@
  ssl_inspector module is responsible for extracting private keys
  from ssl state.  It is a more robust approach to build a C module
  than maintaining a representation of OpenSSL structs in Rust or
- manually chase pointers in Rust.
+ manually chasing pointers in Rust.
  */
 #include <stdio.h>
 #include <stdint.h>

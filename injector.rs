@@ -180,19 +180,19 @@ fn main() {
         println!("argv: {:?}", argv);
         println!("path: {:?}", argv[1]);
 
-        // Try SSL_KEYLOG_FILE env var, like a feature we're trying to mimick
+        // Try SSLKEYLOGFILE env var, like a feature we're trying to mimick
         // The injectee DLL will read this env var
-        if let Some(path) = env::var_os("SSL_KEYLOG_FILE") {
-            println!("passing through SSL_KEYLOG_FILE={:?}", path);
+        if let Some(path) = env::var_os("SSLKEYLOGFILE") {
+            println!("passing through SSLKEYLOGFILE={:?}", path);
         } else {
             // That was not provided, use the directory of the executable
             if let Ok(mut path) = env::current_exe() {
                 path.pop();
                 path.push("ssl_keylog.txt");
                 println!("putting keylog near currently running binary={:?}", path);
-                env::set_var("SSL_KEYLOG_FILE", path);
+                env::set_var("SSLKEYLOGFILE", path);
             } else {
-                println!("could not get SSL_KEYLOG_FILE and current program path?..");
+                println!("could not get SSLKEYLOGFILE and current program path?..");
             }
         }
 

@@ -359,7 +359,7 @@ fn key_writer(receiver: Receiver<(Vec<u8>, Vec<u8>)>, mut file: File) {
 unsafe fn initialize() {
     // decide keylog path depending on env
     let path =
-        if let Some(ssl_keylog) = env::var_os("SSL_KEYLOG_FILE") {
+        if let Some(ssl_keylog) = env::var_os("SSLKEYLOGFILE") {
             PathBuf::from(ssl_keylog)
         } else {
             // ... or use temp dir
@@ -367,7 +367,7 @@ unsafe fn initialize() {
             temp.push("ssl_keylog.txt");
             temp
         };
-    println!("SSL_KEYLOG_PATH={:?}", path);
+    println!("SSLKEYLOGFILE={:?}", path);
 
     let mut file = OpenOptions::new()
         .create(true)

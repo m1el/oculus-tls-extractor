@@ -15,3 +15,9 @@ To use `injector.exe` as a debugger for `OVRServer_x64.exe`, you can use `gflags
 By default, `injectee.dll` will log TLS keys into `ssl_keylog.txt` near its own location.
 To override secret key log location, set system environment variable `SSLKEYLOGFILE`.
 Keylog format is expected to be compatible with [NSS Keylog Format](https://developer.mozilla.org/en-US/docs/Mozilla/Projects/NSS/Key_Log_Format).
+
+## License
+
+This project is distributed under [MIT License](LICENSE.MIT).
+
+Part of this project uses OpenSSL header files, OpenSSL license located at: [openssl-LICENSE](openssl-LICENSE)

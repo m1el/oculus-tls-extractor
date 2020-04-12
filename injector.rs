@@ -167,7 +167,8 @@ fn main() {
         path.push(0);
 
         // Concatenate arguments to create command line
-        // TODO: this does not handle quotes, that doesn't seem to be necessary
+        // TODO: this does not handle quotes/spaces,
+        // but that doesn't seem to be necessary so far
         let mut args = Vec::<u16>::new();
         for arg in &argv[1..] {
             if !args.is_empty() {
@@ -217,8 +218,7 @@ fn main() {
             null_mut(),
             &mut startup_info as *mut STARTUPINFOW,
             &mut proc_info as *mut PROCESS_INFORMATION);
-
-        println!("CreateProcessW result = {}", result);
+        assert!(result != 0, "CreateProcessW failed!");
 
         let mut library_path: Vec<u16>;
 
@@ -236,12 +236,13 @@ fn main() {
 
         // DLL injection
         let kernel32_mod = GetModuleHandleA(b"Kernel32.dll\0".as_ptr() as _);
-        println!("kernel32 module handle: {}", kernel32_mod as usize);
+        assert!(kernel32_mod != null_mut(), "Get Kernel32.dll handle failed?");
 
         // 1) kernel32.dll has the same address space in all running processes
         let load_library_ptr = GetProcAddress(
             kernel32_mod, b"LoadLibraryW\0".as_ptr() as _);
-        println!("load_library_ptr: {}", load_library_ptr as usize);
+        assert!(load_library_ptr != null_mut(),
+            "Get pointer to LoadLibraryW failed?");
 
         // All following operations require us to have certain access
         // to the process, but since we started it in debug mode,
@@ -251,13 +252,13 @@ fn main() {
         let name_ptr = VirtualAllocEx(
             proc_info.hProcess, null_mut(), size_of_slice(&library_path) as _,
             MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        println!("DLL name ptr: {}", name_ptr as usize);
+        assert!(name_ptr != null_mut(), "VirtualAllocEx failed");
 
         // 3) Write library path to the recently allocated memory
         let result = WriteProcessMemory(
             proc_info.hProcess, name_ptr, library_path.as_ptr() as _,
             size_of_slice(&library_path) as _, null_mut());
-        println!("WriteProcessMemory result: {}", result);
+        assert!(result != 0, "WriteProcessMemory failed");
 
         // 4) CreateRemoteThread with kernel32.LoadLibraryW as a starting point
         //    and injectee DLL path as its only argument.
@@ -265,7 +266,7 @@ fn main() {
         let thread_handle = CreateRemoteThread(
                 proc_info.hProcess, null_mut(), 0,
                 load_library_ptr as _, name_ptr, 0, &mut threadid as _);
-        println!("CreateRemoteThread result: {}", thread_handle as usize);
+        assert!(thread_handle != null_mut(), "CreateRemoteThread failed");
 
         // If we started the process in debug mode, the recently
         // created thread won't run, so ignore this code for now
@@ -276,11 +277,11 @@ fn main() {
         match RUN_MODE {
             RunMode::Debug => {
                 let result = DebugActiveProcessStop(proc_info.dwProcessId);
-                println!("DebugActiveProcessStop result: {}", result as usize);
+                assert!(result != 0, "DebugActiveProcessStop failed");
             }
             RunMode::Suspend => {
                 let result = ResumeThread(proc_info.hThread);
-                println!("ResumeThread result: {}", result);
+                assert!(result != 0, "ResumeThread failed");
             }
         }
 

@@ -4,10 +4,13 @@
 use std::cell::RefCell;
 use std::collections::{HashSet};
 use std::env;
-use std::ffi::{c_void};
+use std::mem::{size_of};
+use std::ffi::{c_void, OsString};
+use std::os::windows::ffi::OsStringExt;
+use std::ptr::{null_mut};
 use std::fs::{File, OpenOptions};
 use std::io::{Write};
-use std::path::{PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
@@ -22,6 +25,7 @@ mod winapi {
     pub type HANDLE = *mut c_void;
     pub type LPVOID = *mut c_void;
     pub type LPSTR = *mut u8;
+    pub type LPWSTR = *mut u16;
 
     #[repr(C)]
     pub struct SECURITY_ATTRIBUTES {
@@ -35,6 +39,18 @@ mod winapi {
       pub lpBaseOfDll: LPVOID,
       pub SizeOfImage: DWORD,
       pub EntryPoint: LPVOID,
+    }
+
+    #[derive(Debug)]
+    #[repr(C)]
+    pub struct MEMORY_BASIC_INFORMATION {
+        pub BaseAddress:       LPVOID,
+        pub AllocationBase:    LPVOID,
+        pub AllocationProtect: DWORD,
+        pub RegionSize:        usize,
+        pub State:             DWORD,
+        pub Protect:           DWORD,
+        pub Type:              DWORD,
     }
 
     #[link(name = "Kernel32")]
@@ -61,6 +77,12 @@ mod winapi {
             hTemplateFile: HANDLE,
             ) -> HANDLE;
 
+        pub fn GetModuleFileNameW(
+            hModule: HANDLE,
+            lpFileName: LPWSTR,
+            dSize: DWORD,
+            ) -> DWORD;
+
         pub fn GetModuleHandleA(
             lpModuleName: LPSTR,
             ) -> HANDLE;
@@ -80,6 +102,12 @@ mod winapi {
             flNewProtect:  DWORD,
             lpflOldProtect: *mut DWORD,
             ) -> BOOL;
+
+        pub fn VirtualQuery(
+            lpAddress: LPVOID,
+            lpBuffer: *mut MEMORY_BASIC_INFORMATION,
+            dwLength: usize,
+            ) -> usize;
     }
 
     pub const STD_OUTPUT_HANDLE: DWORD = -11;
@@ -108,6 +136,76 @@ mod winapi {
 
 use winapi::*;
 
+struct PatternFinder<'a> {
+    src: &'a[u8],
+    pattern: &'a[u8],
+    index: usize,
+}
+
+impl<'a> PatternFinder<'a> {
+    /// Construct a new pattern finder for given pattern and source
+    fn new<'b>(pattern: &'b[u8], src: &'b[u8]) -> PatternFinder<'b> {
+        PatternFinder {
+            src,
+            pattern,
+            index: 0
+        }
+    }
+}
+
+impl<'a> Iterator for PatternFinder<'a> {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        let pattern_length = self.pattern.len();
+        let src_length = self.src.len();
+        while self.index + pattern_length <= src_length {
+            let slice = &self.src[self.index..];
+            self.index += 1;
+            if slice.starts_with(self.pattern) {
+                return Some(self.index - 1);
+            }
+        }
+        None
+    }
+}
+
+struct ModuleRegions {
+    ptr: *const c_void,
+    size: usize,
+    offset: usize,
+}
+
+impl ModuleRegions {
+    fn new(module_info: &MODULEINFO) -> Self {
+        ModuleRegions {
+            ptr: module_info.lpBaseOfDll,
+            size: module_info.SizeOfImage as usize,
+            offset: 0,
+        }
+    }
+}
+
+impl Iterator for ModuleRegions {
+    type Item = MEMORY_BASIC_INFORMATION;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.size {
+            return None;
+        }
+        const INFO_SIZE: usize = size_of::<MEMORY_BASIC_INFORMATION>();
+        unsafe {
+            let mut info = std::mem::zeroed::<MEMORY_BASIC_INFORMATION>();
+            let size = VirtualQuery(self.ptr as *mut c_void, &mut info, INFO_SIZE);
+            // whoa, let's stop iterating if the request fails or we're out of region
+            if size != INFO_SIZE || info.AllocationProtect == 0 {
+                return None;
+            }
+            self.offset += info.RegionSize;
+            self.ptr = (self.ptr as *const u8).offset(info.RegionSize as isize) as *const c_void;
+            Some(info)
+        }
+    }
+}
+
 /// Patch -- describes a change made to in-memory program code
 ///
 /// This allows us to overwrite in-memory code of the running process
@@ -118,11 +216,12 @@ struct Patch {
     name: &'static str,
     /// What address we should call with ssl_state pointer
     call_addr: *mut c_void,
+    /// Pattern to look for
+    pattern: &'static[u8],
+    /// Offset from pattern
+    pattern_offset: usize,
     /// Location of call address in the "replacement" code
     addr_offset: usize,
-    /// List of patch target locations.
-    /// This allows us to support multiple versions of the binary
-    locations: &'static[isize],
     /// What code is expected at the specified location.
     /// This allows us to check if the binary has been updated.
     /// We don't want to blindly overwrite random code.
@@ -134,13 +233,15 @@ struct Patch {
 /// Describes possible failures we could encounter when patching
 #[derive(Debug)]
 enum PatchError {
-    /// Locations slice is empty
-    NoLocationsSpecified,
+    /// Pattern not found
+    PatternNotFound,
     /// Patch location is out of range of the DLL address space
     OutOfRange,
     /// Code at the specified location did not match expectation.
     /// Probably means an unsupported version of the DLL
     CodeMismatch,
+    /// There's not enough 0xcc padding after the function end to patch this function
+    NotEnoughSpace,
     /// Could not set memory protection to Read+Write
     VirtualUnProtect,
     /// Could not set memory protection to Read+Execute
@@ -154,25 +255,48 @@ impl Patch {
     /// This function will try to apply patch on multiple location
     /// and return first success or last error.
     pub unsafe fn apply(&self, module_info: &MODULEINFO) -> Result<isize, PatchError> {
-        let mut rv = Err(PatchError::NoLocationsSpecified);
+        let mut rv = Err(PatchError::PatternNotFound);
 
-        for &location in self.locations {
+        let possible_locations = ModuleRegions::new(module_info)
+            // only grab executable regions
+            .filter(|region| region.Protect & PAGE_EXECUTE_READ != 0)
+            .flat_map(|region| {
+                let memory_slice = std::slice::from_raw_parts(
+                        region.BaseAddress as *const u8, region.RegionSize);
+                // find the requested pattern in a given region
+                PatternFinder::new(self.pattern, memory_slice)
+                    .map(move |location| (region.BaseAddress, region.RegionSize, location))
+            })
+            // collect locations into a Vec because if we iterate,
+            // we may invalidate the slice by patching the memory
+            .collect::<Vec<(*mut c_void, usize, usize)>>();
+
+        for (base_ptr, size, location) in possible_locations {
+            let location = (location + self.pattern_offset) as isize;
+
             let maxlen = self.replacement.len().max(self.expect.len());
-            if (module_info.SizeOfImage as usize) < location as usize + maxlen {
+            if size < location as usize + maxlen {
                 rv = Err(PatchError::OutOfRange);
                 continue;
             }
 
             // write in call address at addr_offset in the patch
             let mut patch = self.replacement.to_vec();
-            patch[self.addr_offset..self.addr_offset + std::mem::size_of::<usize>()]
+            patch[self.addr_offset..self.addr_offset + size_of::<usize>()]
                 .clone_from_slice(&(self.call_addr as usize).to_ne_bytes());
 
-            let target_ptr = (module_info.lpBaseOfDll as *mut u8).offset(location);
+            let target_ptr = (base_ptr as *mut u8).offset(location);
             let target_slice = std::slice::from_raw_parts_mut(target_ptr, maxlen);
+
             if &target_slice[..self.expect.len()] != self.expect {
                 rv = Err(PatchError::CodeMismatch);
                 continue;
+            }
+
+            // if the replacement is bigger than the pattern, check if the last instruction
+            // in target slice is int3 (byte 0xcc), meaning we can fit into the padding
+            if self.expect.len() < self.expect.len() && target_slice.last() != Some(&0xcc) {
+                return Err(PatchError::NotEnoughSpace);
             }
 
             // VirtualProtect requires us to pass a pointer to flOldProtect
@@ -182,6 +306,7 @@ impl Patch {
             if result == 0 {
                 return Err(PatchError::VirtualUnProtect);
             }
+
             // Actually apply the patch
             target_slice[..patch.len()].clone_from_slice(&patch);
             // Set memory protection to Read+Execute
@@ -200,8 +325,17 @@ const PATCHES: &[Patch] = &[
     Patch {
         name: "SSL_connect",
         call_addr: ssl_connect_and_peek as _,
-        addr_offset: 2,
-        locations: &[0x74322a, 0x7494ba], // newer first
+        pattern: &[
+            0x48, 0x8b, 0x41, 0x08, // MOV RAX,qword ptr [RCX + 0x8]
+            0xc7, 0x41, 0x48,       // MOV dword ptr [RCX + 0x48],0x5000
+            0x00, 0x50, 0x00, 0x00, //
+            0x48, 0x89, 0x7c,       // MOV qword ptr [RSP + 0x30],RDI
+            0x24, 0x30,
+            0x33, 0xff,             // XOR EDI,EDI
+            0x89, 0x79, 0x38,       // MOV dword ptr [RCX + 0x38],EDI
+            0x89, 0x79, 0x44,       // MOV dword ptr [RCX + 0x44],EDI
+        ],
+        pattern_offset: 0x61,
         // expect to have: 5b 48 ff 60 28: POP RBX; REX.W JMP qword ptr [RAX + 0x28]
         expect: &[0x48, 0x83, 0xc4, 0x20, 0x5b, 0x48, 0xff, 0x60, 0x28],
         // mov  rax, 0x1337133713371337
@@ -209,6 +343,7 @@ const PATCHES: &[Patch] = &[
         // add  rsp, 20
         // pop  rbx
         // ret
+        addr_offset: 2,
         replacement: &[
             0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // movabs rax, ptr
             0xff, 0xd0,             // call   rax
@@ -221,10 +356,25 @@ const PATCHES: &[Patch] = &[
     Patch {
         name: "SSL_set_connect_state",
         call_addr: peek_ssl_keys as _,
-        addr_offset: 5,
-        locations: &[0x743df6, 0x74a086], // newer first
+        pattern: &[
+            0x48, 0x8b, 0x41, 0x08, // MOV RAX,qword ptr [RCX + 0x8]
+            0x33, 0xff,             // XOR EDI,EDI
+            0x89, 0x79, 0x38,       // MOV dword ptr [RCX + 0x38],EDI
+            0x48, 0x8b, 0xd9,       // MOV RBX,RCX
+            0x89, 0x79, 0x44,       // MOV dword ptr [RCX + 0x44],EDI
+            0xc7, 0x41, 0x48,       // MOV dword ptr [RCX + 0x48],0x5000
+            0x00, 0x50, 0x00, 0x00,
+
+        ],
+        pattern_offset: 0x4c,
         // expect to have: 48 8b 5c 24 30: MOV RBX,qword ptr [RSP + 0x30]
-        expect: &[0x48, 0x8b, 0x5c, 0x24, 0x30],
+        expect: &[
+            0x48, 0x89, 0xbb, 0xf0, 0x00, 0x00, 0x00,
+            0x48, 0x8b, 0x5c, 0x24, 0x30,
+            0x48, 0x83, 0xc4, 0x20,
+            0x5f,
+            0xc3,
+        ],
         // mov  rcx, rbx
         // mov  rax, 0x1337133713371337
         // call rax
@@ -232,7 +382,9 @@ const PATCHES: &[Patch] = &[
         // add  rsp, 0x20
         // pop  rdi
         // ret
+        addr_offset: 13,
         replacement: &[
+            0x48, 0x89, 0xbb, 0xf0, 0x00, 0x00, 0x00, // mov qword ptr [0xf0 + rbx], rdi
             0x48, 0x89, 0xd9,             // mov    rcx,rbx
             0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // movabs rax, ptr
             0xff, 0xd0,                   // call rax
@@ -354,6 +506,15 @@ fn key_writer(receiver: Receiver<(Vec<u8>, Vec<u8>)>, mut file: File) {
     }
 }
 
+fn get_exec_name() -> OsString {
+    let mut buf = vec![0u16; 1024];
+    let written = unsafe {
+        GetModuleFileNameW(null_mut(), buf.as_mut_ptr(), buf.len() as i32)
+    };
+    assert!((written as usize) < buf.len(), "whoa, file name is too long?");
+    OsString::from_wide(&buf[0..(written as usize)])
+}
+
 /// initialize will open ssl keylog file, apply patches,
 /// create global SENDER and start the key writer thread.
 unsafe fn initialize() {
@@ -378,20 +539,51 @@ unsafe fn initialize() {
     let (tx, rx) = channel();
     SENDER = Some(tx);
 
+    // mapping between executable name and module that needs to be patched
+    const MODULE_FOR_EXEC: &[(&str, &[u8])] = &[
+        ("OVRServer_x64.exe", b"OculusAppFramework.dll\0"),
+        ("oculus-platform-runtime.exe", b"oculus-platform-runtime.exe\0"),
+        ("OculusDash.exe", b"OculusDash.exe\0"),
+    ];
+
+    let exec_name = get_exec_name();
+    let exec_path = Path::new(&exec_name);
+    file.write_all(format!("exec path = {:?}\n", exec_path).as_bytes())
+        .unwrap();
+    let module_name = MODULE_FOR_EXEC.iter()
+        .find_map(|(file, module)| {
+            if exec_path.ends_with(file) {
+                Some(module)
+            } else {
+                None
+            }
+        });
+
+    let module_name = if let Some(name) = module_name {
+        name
+    } else {
+        file.write_all(format!("whoa, can't find appropriate module name for {:?}\n", exec_path).as_bytes())
+            .unwrap();
+        return;
+    };
+    let utf_mod = std::str::from_utf8(module_name).unwrap();
+    file.write_all(format!("module name = {:?}\n", utf_mod).as_bytes())
+        .unwrap();
+
     let proc = GetCurrentProcess();
-    let handle = GetModuleHandleA(b"OculusAppFramework.dll\0".as_ptr() as _);
+    let handle = GetModuleHandleA(module_name.as_ptr() as _);
     let mut module_info: MODULEINFO = std::mem::zeroed();
     let result = K32GetModuleInformation(
-        proc, handle, &mut module_info,
-        std::mem::size_of::<MODULEINFO>() as DWORD);
+        proc, handle, &mut module_info, size_of::<MODULEINFO>() as DWORD);
     assert!(result != 0);
 
+    file.write_all(format!("going to patch {} locations\n", PATCHES.len()).as_bytes()).unwrap();
     for patch in PATCHES {
         match patch.apply(&module_info) {
-            Ok(addr) => write!(file, "patched: {} at 0x{:x}\n",
-                               patch.name, addr).unwrap(),
-            Err(ee) => write!(file, "cannot patch: {} {:?}\n",
-                              patch.name, ee).unwrap(),
+            Ok(addr) => file.write_all(
+                format!("{:?} patched: {} at 0x{:x}\n", utf_mod, patch.name, addr).as_bytes()).unwrap(),
+            Err(ee) => file.write_all(
+                format!("{:?} cannot patch: {} {:?}\n", utf_mod, patch.name, ee).as_bytes()).unwrap(),
         }
     }
 

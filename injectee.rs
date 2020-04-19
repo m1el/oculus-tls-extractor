@@ -233,7 +233,7 @@ struct Patch {
 /// Describes possible failures we could encounter when patching
 #[derive(Debug)]
 enum PatchError {
-    /// Pattern not found
+    /// Patch didn't find the location to apply to
     PatternNotFound,
     /// Patch location is out of range of the DLL address space
     OutOfRange,

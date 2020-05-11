@@ -1,3 +1,5 @@
+#![feature(untagged_unions)]
+
 /// injectee -- this DLL will be injected into OVRServer_x64 process
 ///
 /// It will patch SSL functions in order to extract private keys
@@ -15,124 +17,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
 /// winapi module -- describing enough win32api surface to work with
-#[allow(dead_code)]
-#[allow(non_snake_case)]
-mod winapi {
-    use std::ffi::{c_void};
-    pub type BOOL = i32;
-    pub type DWORD = i32;
-    pub type HINSTANCE = *mut c_void;
-    pub type HANDLE = *mut c_void;
-    pub type LPVOID = *mut c_void;
-    pub type LPSTR = *mut u8;
-    pub type LPWSTR = *mut u16;
-
-    #[repr(C)]
-    pub struct SECURITY_ATTRIBUTES {
-      pub nLength: DWORD,
-      pub lpSecurityDescriptor: LPVOID,
-      pub bInheritHandle: BOOL,
-    }
-
-    #[repr(C)]
-    pub struct MODULEINFO {
-      pub lpBaseOfDll: LPVOID,
-      pub SizeOfImage: DWORD,
-      pub EntryPoint: LPVOID,
-    }
-
-    #[derive(Debug)]
-    #[repr(C)]
-    pub struct MEMORY_BASIC_INFORMATION {
-        pub BaseAddress:       LPVOID,
-        pub AllocationBase:    LPVOID,
-        pub AllocationProtect: DWORD,
-        pub RegionSize:        usize,
-        pub State:             DWORD,
-        pub Protect:           DWORD,
-        pub Type:              DWORD,
-    }
-
-    #[link(name = "Kernel32")]
-    extern "C" {
-        pub fn GetStdHandle(
-            nStdHandle: DWORD,
-        ) -> HANDLE;
-
-        pub fn WriteConsoleA(
-            hConsoleOutput: HANDLE,
-            lpBuffer: *mut u8,
-            nNumberOfCharsToWrite: DWORD,
-            lpNumberOfCharsWritten: *mut DWORD,
-            lpReserved: LPVOID,
-        ) -> BOOL;
-
-        pub fn CreateFileA(
-            lpFileName: LPSTR,
-            dwDesiredAccess: DWORD,
-            dwShareMode: DWORD,
-            lpSecurityAttributes: *mut SECURITY_ATTRIBUTES,
-            dwCreationDisposition: DWORD,
-            dwFlagsAndAttributes: DWORD,
-            hTemplateFile: HANDLE,
-            ) -> HANDLE;
-
-        pub fn GetModuleFileNameW(
-            hModule: HANDLE,
-            lpFileName: LPWSTR,
-            dSize: DWORD,
-            ) -> DWORD;
-
-        pub fn GetModuleHandleA(
-            lpModuleName: LPSTR,
-            ) -> HANDLE;
-
-        pub fn GetCurrentProcess() -> HANDLE;
-
-        pub fn K32GetModuleInformation(
-            hProcess:  HANDLE,
-            hModule:   HANDLE,
-            lpmodinfo: *mut MODULEINFO,
-            cb:         DWORD,
-            ) -> BOOL;
-
-        pub fn VirtualProtect(
-            lpAddress:     LPVOID,
-            dwSize:        usize,
-            flNewProtect:  DWORD,
-            lpflOldProtect: *mut DWORD,
-            ) -> BOOL;
-
-        pub fn VirtualQuery(
-            lpAddress: LPVOID,
-            lpBuffer: *mut MEMORY_BASIC_INFORMATION,
-            dwLength: usize,
-            ) -> usize;
-    }
-
-    pub const STD_OUTPUT_HANDLE: DWORD = -11;
-    pub const INVALID_HANDLE_VALUE: HANDLE = !0 as _;
-    pub const DLL_PROCESS_DETACH: DWORD = 0;
-    pub const DLL_PROCESS_ATTACH: DWORD = 1;
-    pub const DLL_THREAD_ATTACH: DWORD = 2;
-    pub const DLL_THREAD_DETACH: DWORD = 3;
-
-    pub const GENERIC_READ    : DWORD = -0x80000000;
-    pub const GENERIC_WRITE   : DWORD = 0x40000000;
-    pub const GENERIC_EXECUTE : DWORD = 0x20000000;
-    pub const GENERIC_ALL     : DWORD = 0x10000000;
-    pub const FILE_SHARE_WRITE: DWORD = 2;
-
-    pub const CREATE_NEW: DWORD = 1;
-    pub const CREATE_ALWAYS: DWORD = 2;
-    pub const OPEN_EXISTING: DWORD = 3;
-    pub const OPEN_ALWAYS: DWORD = 4;
-    pub const TRUNCATE_EXISTING: DWORD = 5;
-
-    pub const PAGE_EXECUTE: DWORD = 0x10;
-    pub const PAGE_EXECUTE_READ: DWORD = 0x20;
-    pub const PAGE_READWRITE: DWORD = 0x04;
-}
+mod winapi;
 
 use winapi::*;
 

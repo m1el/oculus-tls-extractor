@@ -7,6 +7,13 @@ For details, please read the [accompanying post](http://m1el.github.io/oculus-tl
 **Note:** this codebase is only intended for experimentation and documentation of reverse engineering.
 Using this code may cause system instability and crash your Oculus Runtime.
 
+## Building
+
+1. `cargo build --release`
+2. Copy the binaries from `target/release` directory.
+
+If you want to rebuild `ssl_inspector.lib`, run `cargo build --features=build-ssl-lib --release`.
+
 ## Usage
 
 To use `injector.exe` as a debugger for `OVRServer_x64.exe`, you can use `gflags` or `regedit`.

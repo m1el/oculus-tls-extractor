@@ -172,6 +172,12 @@ impl Injector {
             return;
         }
 
+        // handle for OVRServiceStopEvent is passed as
+        // the first argument to OVRServer_x64.exe
+        let stop_service_event = argv.get(2)
+            .and_then(|s| s.to_str())
+            .and_then(|s| usize::from_str_radix(s, 16).ok());
+
         let mut path: Vec<u16> = argv[1].encode_wide().collect();
         path.push(0);
 
@@ -223,13 +229,22 @@ impl Injector {
             args.as_mut_ptr(),
             null_mut::<SECURITY_ATTRIBUTES>(),
             null_mut::<SECURITY_ATTRIBUTES>(),
-            0,
+            1,
             start_mode,
             null_mut(),
             null_mut(),
             &mut startup_info as *mut STARTUPINFOW,
             &mut proc_info as *mut PROCESS_INFORMATION);
         assert!(result != 0, "CreateProcessW failed!");
+
+        if let Some(handle) = stop_service_event {
+            // If the debug handle is present and we've received
+            // service stop event then exit successfully.
+            std::thread::spawn(move || {
+                WaitForSingleObject(handle as HANDLE, INFINITE);
+                std::process::exit(0);
+            });
+        }
 
         // If we started the process in debug mode, the recently
         // created thread won't run, so ignore this code for now
@@ -252,7 +267,6 @@ impl Injector {
                 println!("WaitForSingleObject result = {}", result);
             }
         }
-
     }
 
     /// This function will run when a debuggee process has started.
@@ -300,7 +314,7 @@ impl Injector {
         let mut continue_status = DBG_CONTINUE;
         let mut debug_event = std::mem::zeroed::<DEBUG_EVENT>();
         let debug_event = &mut debug_event;
-        while WaitForDebugEvent(debug_event, INFINITE) != 0 {
+        while WaitForDebugEventEx(debug_event, INFINITE) != 0 {
             writeln!(self.output, "debug event = {}", debug_event.dwDebugEventCode).unwrap();
             match debug_event.dwDebugEventCode {
                 EXCEPTION_DEBUG_EVENT => {

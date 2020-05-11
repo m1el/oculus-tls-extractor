@@ -258,7 +258,7 @@ extern "C" {
         dwProcessId: DWORD
         ) -> BOOL;
 
-    pub fn WaitForDebugEvent(
+    pub fn WaitForDebugEventEx(
         lpDebugEvent: *mut DEBUG_EVENT,
         dwMilliseconds: DWORD,
         ) -> BOOL;

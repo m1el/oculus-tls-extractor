@@ -456,7 +456,7 @@ unsafe fn initialize() {
             .unwrap();
         return;
     };
-    let utf_mod = std::str::from_utf8(module_name).unwrap();
+    let utf_mod = std::str::from_utf8(module_name).unwrap().trim_matches('\0');
     file.write_all(format!("module name = {:?}\n", utf_mod).as_bytes())
         .unwrap();
 

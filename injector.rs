@@ -61,7 +61,7 @@ unsafe fn dump_memory(output: &mut File, process: HANDLE, ptr: LPVOID, size: usi
     assert!(rv == mbi_size, "MEMORY_BASIC_INFORMATION bad size?");
     let module = mbi.AllocationBase;
     // Get module name given its handle
-    if module != null_mut() {
+    if !module.is_null() {
         let mut buf = vec![0_u8; 512];
         let sz = K32GetModuleBaseNameA(process, module, buf.as_mut_ptr(), buf.len() as i32);
         buf.truncate(sz as usize);
@@ -77,12 +77,12 @@ unsafe fn dump_memory(output: &mut File, process: HANDLE, ptr: LPVOID, size: usi
 /// Inject a dll into a process specified by `process` handle
 unsafe fn inject_snoop_dll(process: HANDLE, dll_path: &[u16]) {
     let kernel32_mod = GetModuleHandleA(b"Kernel32.dll\0".as_ptr() as _);
-    assert!(kernel32_mod != null_mut(), "Get Kernel32.dll handle failed?");
+    assert!(!kernel32_mod.is_null(), "Get Kernel32.dll handle failed?");
 
     // 1) kernel32.dll has the same address space in all running processes
     let load_library_ptr = GetProcAddress(
         kernel32_mod, b"LoadLibraryW\0".as_ptr() as _);
-    assert!(load_library_ptr != null_mut(),
+    assert!(!load_library_ptr.is_null(),
         "Get pointer to LoadLibraryW failed?");
 
     // All following operations require us to have certain access
@@ -93,7 +93,7 @@ unsafe fn inject_snoop_dll(process: HANDLE, dll_path: &[u16]) {
     let name_ptr = VirtualAllocEx(
         process, null_mut(), size_of_slice(dll_path) as _,
         MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    assert!(name_ptr != null_mut(), "VirtualAllocEx failed");
+    assert!(!name_ptr.is_null(), "VirtualAllocEx failed");
 
     // 3) Write library path to the recently allocated memory
     let result = WriteProcessMemory(
@@ -107,7 +107,7 @@ unsafe fn inject_snoop_dll(process: HANDLE, dll_path: &[u16]) {
     let thread_handle = CreateRemoteThread(
             process, null_mut(), 0,
             load_library_ptr as _, name_ptr, 0, &mut threadid as _);
-    assert!(thread_handle != null_mut(), "CreateRemoteThread failed");
+    assert!(!thread_handle.is_null(), "CreateRemoteThread failed");
     println!("injected successfully?");
 }
 

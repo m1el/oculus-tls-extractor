@@ -85,7 +85,7 @@ impl Iterator for ModuleRegions {
                 return None;
             }
             self.offset += info.RegionSize;
-            self.ptr = (self.ptr as *const u8).offset(info.RegionSize as isize) as *const c_void;
+            self.ptr = (self.ptr as *const u8).add(info.RegionSize) as *const c_void;
             Some(info)
         }
     }
@@ -139,6 +139,8 @@ impl Patch {
     /// Returns either location of change or error occured during patch.
     /// This function will try to apply patch on multiple location
     /// and return first success or last error.
+    /// # Safety
+    /// This is inherently unsafe because we're patching program memory
     pub unsafe fn apply(&self, module_info: &MODULEINFO) -> Result<isize, PatchError> {
         let mut rv = Err(PatchError::PatternNotFound);
 
@@ -281,14 +283,17 @@ const PATCHES: &[Patch] = &[
     },
 ];
 
+// A type definition for a sender that sends private keys
+type PkSender = Sender<(Vec<u8>, Vec<u8>)>;
+
 // This sender will be used by all threads to clone their own senders from.
 // We don't control when threads start or what they're data is going to be.
-static mut SENDER: Option<Sender<(Vec<u8>, Vec<u8>)>> = None;
+static mut SENDER: Option<PkSender> = None;
 
 thread_local! {
     // ... each thread is going to store its own sender in ThreadLocalStorage
     // cloned from the global SENDER
-    static LOCAL_SENDER: RefCell<Option<Sender<(Vec<u8>, Vec<u8>)>>> =
+    static LOCAL_SENDER: RefCell<Option<PkSender>> =
         RefCell::new(unsafe { SENDER.clone() });
 }
 
@@ -314,7 +319,7 @@ extern "C" {
 /// One solution is to move part of that function here.
 /// We patch out ssl->method->ssl_connect() and do it here
 #[no_mangle]
-pub unsafe fn ssl_connect_and_peek(raw: *mut c_void) -> i32 {
+unsafe fn ssl_connect_and_peek(raw: *mut c_void) -> i32 {
     let rv = ssl_get_ssl_connect(raw)(raw);
     peek_ssl_keys(raw);
     rv
@@ -323,7 +328,7 @@ pub unsafe fn ssl_connect_and_peek(raw: *mut c_void) -> i32 {
 /// Extract private keys using pointer to ssl_state struct and
 /// send them to the writer thread.
 #[no_mangle]
-pub unsafe fn peek_ssl_keys(raw: *mut c_void) {
+unsafe fn peek_ssl_keys(raw: *mut c_void) {
     let keys = {
         let mut pk_data = std::mem::zeroed();
         ssl_read_pk_data(raw, &mut pk_data);
@@ -478,7 +483,7 @@ unsafe fn initialize() {
 /// Entry point for the DLL
 #[no_mangle]
 #[allow(non_snake_case)]
-pub unsafe fn DllMain(
+pub fn DllMain(
     _hinst_dll: HINSTANCE,
     fdw_reason: DWORD,
     _lp_reserved: LPVOID
@@ -487,7 +492,7 @@ pub unsafe fn DllMain(
     // This function can be called on many occasions.
     // We only want to do initialization on DLL load.
     if fdw_reason == DLL_PROCESS_ATTACH {
-        initialize();
+        unsafe { initialize() };
     }
     1
 }

@@ -16,3 +16,6 @@ name = "injector"
 crate-type = ["cdylib"]
 path = "injectee.rs"
 name = "injectee"
+
+[features]
+build-ssl-lib = []

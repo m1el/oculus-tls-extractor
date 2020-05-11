@@ -9,7 +9,7 @@ mod build_ssl_lib {
     use std::process::{self, Command};
 
     /// Check if a command is working and returning the expected results.
-    fn check_command(command: &str, args: &[&str],
+    fn check_output(command: &str, args: &[&str],
                      expected: &[&str]) -> Option<()> {
         // Invoke the command
         let result = Command::new(command).args(args).output().ok()?;
@@ -28,7 +28,7 @@ mod build_ssl_lib {
         }
     }
 
-    /// Check if a command is working and returning the expected results.
+    /// Check if a command has returned successfully
     fn check_status(command: &str, args: &[&str], dir: &str, err: &'static str)
         -> Result<(), Box<dyn Error>>
     {
@@ -41,17 +41,22 @@ mod build_ssl_lib {
         }
     }
 
+    /// URL to OpenSSL git
     const OPENSSL_GIT: &str = "https://github.com/openssl/openssl.git";
+    /// Directory for OpenSSL to check out to
     const OPENSSL_DIR: &str = "openssl";
+    /// Specific OpenSSL version to use
     const OPENSSL_VERSION: &str = "OpenSSL_1_0_2o";
+    /// Path to patch which is applied to OpenSSL,
+    /// allowing us to build the inspector lib
     const OPENSSL_PATCH: &str = "ssl_inspector.patch";
 
     pub fn do_build() -> Result<(), Box<dyn Error>> {
-        check_command("git", &["--version"], &["git"])
+        check_output("git", &["--version"], &["git"])
             .ok_or("git needs to be visible in $PATH to build OpenSSL")?;
-        check_command("perl", &["--version"], &["perl 5"])
+        check_output("perl", &["--version"], &["perl 5"])
             .ok_or("Perl needs to be present to configure and build OpenSSL")?;
-        check_command("nmake", &["/?"], &["NMAKE"])
+        check_output("nmake", &["/?"], &["NMAKE"])
             .ok_or("Visual Studio environment is expected")?;
 
         if !Path::new(OPENSSL_DIR).is_dir() {
@@ -61,29 +66,38 @@ mod build_ssl_lib {
             }
         }
 
+        // Check out a specific version of OpenSSL
         check_status("git", &["checkout", "-f", OPENSSL_VERSION], OPENSSL_DIR,
-                     "Failed to check out the required version. 1")?;
+                     "Failed to check out the required version. \
+                     (checking out specific commit)")?;
+        // Also check out all files in case there were changes
         check_status("git", &["checkout", "-f", "--", "."], OPENSSL_DIR,
-                     "Failed to check out the required version. 2")?;
+                     "Failed to check out the required version. \
+                     (checking out files)")?;
 
         let mut file = File::open(OPENSSL_PATCH)?;
+        // Apply the patch to the OpenSSL makefile
         let mut process = Command::new("git").args(&["apply"])
             .stdin(process::Stdio::piped())
             .stdout(process::Stdio::null())
             .current_dir(OPENSSL_DIR)
             .spawn()?;
 
+        // Pass the patch to stdin of `git apply`
         io::copy(&mut file, process.stdin.as_mut().unwrap())?;
         if !process.wait()?.success() {
             return Err("Failed to apply the patch.")?;
         }
 
+        // Configure OpenSSL
         check_status("perl", &["Configure", "VC-WIN64A"], OPENSSL_DIR,
                      "Failed to configure OpenSSL.")?;
+        // Generate Makefile for nmake
         check_status("cmd.exe", &["/C", "ms\\do_win64a.bat"], OPENSSL_DIR,
                      "Failed to run do_win64a.bat")?;
-        check_status("nmake", &["-nologo", "-f", "ms\\nt.mak", "ssl_inspector"], OPENSSL_DIR,
-                     "Failed to run nmake")?;
+        // Build ssl_inspector static library
+        check_status("nmake", &["-nologo", "-f", "ms\\nt.mak", "ssl_inspector"],
+                     OPENSSL_DIR, "Failed to run nmake")?;
 
         Ok(())
     }
